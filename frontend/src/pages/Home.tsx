@@ -18,8 +18,16 @@ export default function Home() {
       const result = await checkEligibility(profile);
       saveEligibility(result);
       navigate("/schemes");
-    } catch {
-      setError("Could not check eligibility. Is the backend running on port 8000?");
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      const isNetwork = (err as { code?: string }).code === "ERR_NETWORK";
+      setError(
+        msg ||
+          (isNetwork
+            ? "Cannot reach the backend at http://localhost:3001. Start it with: cd backend && bun run dev"
+            : "Could not check eligibility. Check backend (port 3001) and browser console for CORS errors.")
+      );
     } finally {
       setLoading(false);
     }

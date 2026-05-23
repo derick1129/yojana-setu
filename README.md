@@ -24,7 +24,7 @@ bun run db:generate
 bun run dev
 ```
 
-Backend: http://localhost:8000
+Backend: http://localhost:3001
 
 ### 2. Frontend
 

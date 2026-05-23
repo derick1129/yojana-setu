@@ -7,11 +7,22 @@ import { mkdir } from "fs/promises";
 import { join } from "path";
 
 const app = express();
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 3001;
 
 await mkdir(join(process.cwd(), "uploads"), { recursive: true });
 
-app.use(cors({ origin: "http://localhost:5173" }));
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow Vite on 5173, 5174, etc. when another dev server holds the default port
+      if (!origin || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+  })
+);
 app.use(express.json());
 
 app.use("/uploads", express.static(join(process.cwd(), "uploads")));
