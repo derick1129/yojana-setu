@@ -100,8 +100,15 @@ export default function DocumentUpload({
     [schemeId, documentType, userProfile]
   );
 
+  const hiddenExtractKeys = new Set([
+    "analysisFailed",
+    "documentTypeMatches",
+    "readable",
+  ]);
   const extractedEntries = result
-    ? Object.entries(result.extractedFields).filter(([, v]) => v != null && v !== "")
+    ? Object.entries(result.extractedFields).filter(
+        ([k, v]) => !hiddenExtractKeys.has(k) && v != null && v !== "" && typeof v !== "boolean"
+      )
     : [];
 
   return (
@@ -136,7 +143,7 @@ export default function DocumentUpload({
 
       {status === "validating" && (
         <div className="text-center py-8 text-yellow-800">
-          <Spinner /> Validating with AI…
+          <Spinner /> Analyzing document with AI vision…
         </div>
       )}
 

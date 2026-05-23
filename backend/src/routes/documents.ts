@@ -3,8 +3,7 @@ import multer from "multer";
 import { join, extname } from "path";
 import { v4 as uuidv4 } from "uuid";
 import { prisma } from "../lib/prisma";
-import { extractTextFromFile } from "../services/ocrService";
-import { extractDocumentFields } from "../services/geminiService";
+import { extractDocumentFieldsFromFile } from "../services/geminiService";
 import { validateDocument } from "../services/validationService";
 import type { UserProfile } from "../services/eligibilityEngine";
 
@@ -62,32 +61,29 @@ documentsRouter.post(
     });
 
     try {
-      const ocrResult = await extractTextFromFile(req.file.path);
+      const extracted = await extractDocumentFieldsFromFile(req.file.path, documentType);
+      const validation = validateDocument(extracted, userProfile, documentType);
+      const finalStatus: "pass" | "fail" | "ocr_failed" =
+        extracted.analysisFailed ? "fail" : !extracted.readable ? "ocr_failed" : validation.status;
 
-      if (!ocrResult.success) {
-        await prisma.documentUpload.update({
-          where: { id: uploadRecord.id },
-          data: { status: "ocr_failed" },
-        });
-        return res.status(422).json({
-          uploadId: uploadRecord.id,
-          status: "ocr_failed",
-          message: ocrResult.error,
-        });
-      }
-
-      const extractedFields = await extractDocumentFields(ocrResult.text, documentType);
-      const validation = validateDocument(extractedFields, userProfile);
+      const previewText = [
+        extracted.detectedDocumentType && `Detected: ${extracted.detectedDocumentType}`,
+        extracted.extractionNotes,
+        extracted.fullName && `Name: ${extracted.fullName}`,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+        .substring(0, 300);
 
       const updated = await prisma.documentUpload.update({
         where: { id: uploadRecord.id },
         data: {
-          status: validation.status,
+          status: finalStatus,
           confidenceScore: validation.confidenceScore,
-          extractedFields: extractedFields as object,
+          extractedFields: extracted as object,
           errors: validation.errors as object[],
           warnings: validation.warnings as object[],
-          ocrTextPreview: ocrResult.text.substring(0, 300),
+          ocrTextPreview: previewText || null,
         },
       });
 
@@ -95,9 +91,9 @@ documentsRouter.post(
         uploadId: updated.id,
         documentType,
         schemeId,
-        status: validation.status,
+        status: finalStatus,
         confidenceScore: validation.confidenceScore,
-        extractedFields,
+        extractedFields: extracted,
         errors: validation.errors,
         warnings: validation.warnings,
         ocrTextPreview: updated.ocrTextPreview,

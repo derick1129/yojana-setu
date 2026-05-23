@@ -7,7 +7,7 @@ Government scheme discovery and application platform for Indian citizens. Built 
 - **Frontend**: React + Vite + TypeScript + Tailwind CSS
 - **Backend**: Bun + Express + TypeScript
 - **Database**: Neon (Postgres) + Prisma
-- **OCR**: Tesseract.js · **LLM**: Google Gemini (`gemini-1.5-flash`)
+- **Document AI**: Google Gemini Vision (`gemini-1.5-flash` recommended/default with model fallback support) — reads images/PDFs directly
 
 ## Quick start
 
