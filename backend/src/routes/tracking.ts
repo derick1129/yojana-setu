@@ -3,6 +3,11 @@ import { prisma } from "../lib/prisma";
 
 export const trackingRouter = Router();
 
+function routeId(req: Request): string {
+  const id = req.params.id;
+  return Array.isArray(id) ? id[0] : id;
+}
+
 const STATUS_ORDER = [
   "submitted",
   "under_review",
@@ -51,7 +56,7 @@ trackingRouter.get("/applications", async (_req: Request, res: Response) => {
 trackingRouter.get("/applications/:id", async (req: Request, res: Response) => {
   try {
     const application = await prisma.application.findUnique({
-      where: { id: req.params.id },
+      where: { id: routeId(req) },
     });
     if (!application) return res.status(404).json({ error: "Application not found" });
     return res.json(application);
@@ -63,7 +68,7 @@ trackingRouter.get("/applications/:id", async (req: Request, res: Response) => {
 trackingRouter.patch("/applications/:id/advance", async (req: Request, res: Response) => {
   try {
     const application = await prisma.application.findUnique({
-      where: { id: req.params.id },
+      where: { id: routeId(req) },
     });
 
     if (!application) return res.status(404).json({ error: "Application not found" });
@@ -77,7 +82,7 @@ trackingRouter.patch("/applications/:id/advance", async (req: Request, res: Resp
     const history = application.statusHistory as Array<{ status: string; changedAt: string; note: string }>;
 
     const updated = await prisma.application.update({
-      where: { id: req.params.id },
+      where: { id: routeId(req) },
       data: {
         status: nextStatus,
         statusHistory: [
