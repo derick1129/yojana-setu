@@ -1,0 +1,42 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_URL")
+}
+
+model Application {
+  id             String   @id @default(uuid())
+  schemeId       String
+  schemeName     String
+  schemeCategory String
+  userName       String
+  userProfile    Json
+  submittedAt    DateTime @default(now())
+  status         String   @default("submitted")
+  statusHistory  Json     @default("[]")
+  documents      Json     @default("[]")
+  notes          String?
+
+  @@map("applications")
+}
+
+model DocumentUpload {
+  id              String   @id @default(uuid())
+  schemeId        String
+  documentType    String
+  originalName    String
+  filePath        String
+  status          String   @default("pending")
+  confidenceScore Int      @default(0)
+  extractedFields Json     @default("{}")
+  errors          Json     @default("[]")
+  warnings        Json     @default("[]")
+  ocrTextPreview  String?
+  createdAt       DateTime @default(now())
+
+  @@map("document_uploads")
+}
