@@ -33,6 +33,28 @@ app.use("/api", trackingRouter);
 
 app.get("/api/health", (_, res) => res.json({ status: "ok" }));
 
+app.get("/api/debug/gemini", async (req, res) => {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key?.trim()) {
+    return res.json({ ok: false, error: "GEMINI_API_KEY is missing or empty" });
+  }
+
+  try {
+    const { GoogleGenerativeAI } = await import("@google/generative-ai");
+    const genAI = new GoogleGenerativeAI(key);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const result = await model.generateContent("Reply with just the word WORKING");
+    const text = result.response.text().trim();
+    return res.json({ ok: true, response: text, keyPrefix: key.slice(0, 8) + "..." });
+  } catch (err) {
+    return res.json({
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      keyPrefix: key.slice(0, 8) + "...",
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Yojana Setu backend running on http://localhost:${PORT}`);
 });

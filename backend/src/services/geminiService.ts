@@ -4,11 +4,13 @@ import { extname } from "path";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
 
-/** Free-tier friendly default; override with GEMINI_MODEL in .env */
-const DEFAULT_MODEL = "gemini-1.5-flash";
+// ✅ FIXED: gemini-1.5-flash is removed from v1beta API (returns 404)
+//           gemini-1.5-flash-latest is the correct alias that still works on free tier
+//           gemini-2.0-flash-lite has much higher free quota than gemini-2.0-flash
+const DEFAULT_MODEL = "gemini-1.5-flash-latest";
 
 const FALLBACK_MODELS = (
-  process.env.GEMINI_MODEL_FALLBACKS ?? "gemini-1.5-flash"
+  process.env.GEMINI_MODEL_FALLBACKS ?? "gemini-1.5-flash-latest,gemini-2.0-flash-lite"
 )
   .split(",")
   .map((m) => m.trim())
@@ -118,6 +120,7 @@ Return ONLY valid JSON (no markdown fences):
   "casteCategory": "General or OBC or SC or ST or null"
 }`;
 }
+
 function extractJsonPayload(raw: string): string {
   const withoutFences = raw.replace(/```(?:json)?/gi, "").trim();
   const firstBrace = withoutFences.indexOf("{");
@@ -197,18 +200,15 @@ function isQuotaError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /429|quota|Too Many Requests|RESOURCE_EXHAUSTED/i.test(msg);
 }
+
 function isConfigError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /API[_\s-]?key.*(invalid|missing)|PERMISSION_DENIED|UNAUTHENTICATED|authentication|forbidden/i.test(
-    msg
-  );
+  return /API[_\s-]?key.*(invalid|missing)|PERMISSION_DENIED|UNAUTHENTICATED|authentication|forbidden/i.test(msg);
 }
 
 function isModelError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /models\/.*(not found|is not found)|unknown model|unsupported model|invalid model|for API version/i.test(
-    msg
-  );
+  return /models\/.*(not found|is not found)|unknown model|unsupported model|invalid model|for API version/i.test(msg);
 }
 
 function conciseErrorMessage(err: unknown): string {
@@ -230,21 +230,22 @@ function friendlyApiError(err: unknown): { message: string; failureReason: Visio
     return {
       failureReason: "quota",
       message:
-        "Gemini API free-tier quota exceeded. Wait about 1 minute and try again. In backend/.env set GEMINI_MODEL=gemini-1.5-flash (recommended for free tier).",
+        "Gemini API free-tier quota exceeded. Wait about 1 minute and try again, or generate a fresh API key at aistudio.google.com/apikey.",
     };
   }
   if (isConfigError(err)) {
     return {
       failureReason: "config",
       message:
-        "Gemini authentication failed. Check GEMINI_API_KEY and ensure Gemini API access is enabled for the key.",
+        "Gemini authentication failed. Check GEMINI_API_KEY in backend/.env and ensure the Gemini API is enabled for that key.",
     };
   }
   if (isModelError(err)) {
     return {
       failureReason: "api",
+      // ✅ FIXED: helpful message telling user exactly what to set
       message:
-        "Configured Gemini model is unavailable for this API key/version. Use GEMINI_MODEL=gemini-1.5-flash or set GEMINI_MODEL_FALLBACKS with valid models.",
+        "Gemini model not available. Set GEMINI_MODEL=gemini-1.5-flash-latest in backend/.env and restart the server.",
     };
   }
   return {
@@ -278,6 +279,7 @@ export async function extractDocumentFieldsFromFile(
   filePath: string,
   expectedDocumentType: string
 ): Promise<VisionExtractionResult> {
+   console.log("Models to try:", modelsToTry(), "Key prefix:", process.env.GEMINI_API_KEY?.slice(0, 8))
   if (!process.env.GEMINI_API_KEY?.trim()) {
     return emptyVisionResult(
       "GEMINI_API_KEY is not configured on the server.",
@@ -304,20 +306,17 @@ export async function extractDocumentFieldsFromFile(
       const { message, failureReason } = friendlyApiError(err);
       failures.push({ modelName, message, failureReason });
       if (failureReason === "config") {
+        // Wrong API key — no point trying other models
         return emptyVisionResult(message, failureReason);
       }
       continue;
     }
   }
 
+  // All models failed — return the most useful error
   const quotaFailure = failures.find((f) => f.failureReason === "quota");
   if (quotaFailure) {
     return emptyVisionResult(quotaFailure.message, "quota");
-  }
-
-  const modelFailure = failures.find((f) => /model/i.test(f.message));
-  if (modelFailure) {
-    return emptyVisionResult(modelFailure.message, "api");
   }
 
   const lastFailure = failures.at(-1);
