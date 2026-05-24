@@ -1,25 +1,7 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { createWorker } from "tesseract.js";
 import { readFile } from "fs/promises";
 import { extname } from "path";
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
-
-// ✅ FIXED: gemini-1.5-flash is removed from v1beta API (returns 404)
-//           gemini-1.5-flash-latest is the correct alias that still works on free tier
-//           gemini-2.0-flash-lite has much higher free quota than gemini-2.0-flash
-const DEFAULT_MODEL = "gemini-1.5-flash-latest";
-
-const FALLBACK_MODELS = (
-  process.env.GEMINI_MODEL_FALLBACKS ?? "gemini-1.5-flash-latest,gemini-2.0-flash-lite"
-)
-  .split(",")
-  .map((m) => m.trim())
-  .filter(Boolean);
-
-function modelsToTry(): string[] {
-  const primary = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
-  return [...new Set([primary, ...FALLBACK_MODELS])];
-}
+import pdfParse from "pdf-parse";
 
 export interface ExtractedDocumentFields {
   fullName: string | null;
@@ -86,242 +68,195 @@ function mimeFromPath(filePath: string): string {
   return map[extname(filePath).toLowerCase()] ?? "application/octet-stream";
 }
 
-function buildVisionPrompt(expectedDocumentType: string): string {
-  return `You are verifying Indian government documents for a welfare scheme application.
+const TESSERACT_LANG = "eng";
+let ocrWorker: Awaited<ReturnType<typeof createWorker>> | undefined;
 
-The applicant MUST upload this document type for this slot: "${expectedDocumentType}"
+async function getOcrWorker() {
+  if (ocrWorker) return ocrWorker;
 
-Examine the attached image or PDF carefully (read text and layout visually).
-
-Tasks:
-1. Identify what document this actually is (e.g. Aadhaar Card, Ration Card, PAN Card, Income Certificate, BPL Certificate, Bank Passbook, Land Record, Caste Certificate, etc.).
-2. Set "documentTypeMatches" to true ONLY if this file is the correct document for the slot "${expectedDocumentType}".
-   - Example: ration card uploaded for "Aadhaar Card" slot → documentTypeMatches: false
-   - "Bank passbook" slot with a passbook → true
-3. Set "readable" to false if blank, corrupted, too blurry, or not a document.
-4. Extract visible fields. Use null when not visible.
-
-Return ONLY valid JSON (no markdown fences):
-{
-  "detectedDocumentType": "string — what you see",
-  "documentTypeMatches": true or false (boolean, not string),
-  "readable": true or false (boolean, not string),
-  "extractionNotes": "string or null — explain mismatch/unreadable",
-  "fullName": "string or null",
-  "dateOfBirth": "DD/MM/YYYY or null",
-  "annualIncome": number or null,
-  "documentNumber": "string or null",
-  "issuingAuthority": "string or null",
-  "dateOfIssue": "DD/MM/YYYY or null",
-  "address": "string or null",
-  "fatherName": "string or null",
-  "gender": "Male or Female or Other or null",
-  "aadhaarNumber": "12-digit string or null",
-  "casteCategory": "General or OBC or SC or ST or null"
-}`;
+  ocrWorker = await createWorker(TESSERACT_LANG, undefined, {
+    logger: () => undefined,
+  });
+  await ocrWorker.load();
+  await ocrWorker.reinitialize(TESSERACT_LANG);
+  return ocrWorker;
 }
 
-function extractJsonPayload(raw: string): string {
-  const withoutFences = raw.replace(/```(?:json)?/gi, "").trim();
-  const firstBrace = withoutFences.indexOf("{");
-  const lastBrace = withoutFences.lastIndexOf("}");
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    return withoutFences;
-  }
-  return withoutFences.slice(firstBrace, lastBrace + 1);
+function normalizeText(text: string): string {
+  return text
+    .replace(/\u00A0/g, " ")
+    .replace(/\r/g, "")
+    .replace(/\t/g, " ")
+    .replace(/ +/g, " ")
+    .trim();
 }
 
-function asNullableString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const cleaned = value.trim();
-  return cleaned.length > 0 ? cleaned : null;
+function getLines(text: string): string[] {
+  return normalizeText(text)
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
-function asNullableNumber(value: unknown): number | null {
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
-  }
-  if (typeof value === "string") {
-    const cleaned = value.replace(/[^\d.-]/g, "").trim();
-    if (!cleaned) return null;
-    const num = Number(cleaned);
-    return Number.isFinite(num) ? num : null;
+function extractLineValue(line: string): string | null {
+  const separator = line.match(/[:\-–]/);
+  if (!separator) return null;
+  return line.slice(separator.index! + 1).trim() || null;
+}
+
+function extractLabelValue(lines: string[], labels: RegExp[]): string | null {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (labels.some((pattern) => pattern.test(line))) {
+      const value = extractLineValue(line);
+      if (value) return value;
+      if (i + 1 < lines.length) return lines[i + 1];
+    }
   }
   return null;
 }
 
-function asBoolean(value: unknown, fallback: boolean): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value !== 0;
-  if (typeof value === "string") {
-    const cleaned = value.trim().toLowerCase();
-    if (["true", "yes", "1"].includes(cleaned)) return true;
-    if (["false", "no", "0"].includes(cleaned)) return false;
-  }
-  return fallback;
+function extractDate(text: string): string | null {
+  const matches = text.match(/\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{4})\b/);
+  if (!matches?.[1]) return null;
+  const parts = matches[1].replace(/\-/g, "/").replace(/\./g, "/").split("/");
+  if (parts.length !== 3) return matches[1];
+  const [d, m, y] = parts.map((part) => part.padStart(2, "0"));
+  return `${d}/${m}/${y}`;
 }
 
-function parseVisionJson(raw: string): VisionExtractionResult {
-  const payload = extractJsonPayload(raw);
-  let parsedUnknown: unknown;
-  try {
-    parsedUnknown = JSON.parse(payload);
-  } catch {
-    throw new Error("Gemini returned non-JSON output.");
-  }
+function extractAadhaarNumber(text: string): string | null {
+  const normalized = text.replace(/\s+/g, "");
+  const match = normalized.match(/\b(\d{12})\b/);
+  return match?.[1] ?? null;
+}
 
-  if (!parsedUnknown || typeof parsedUnknown !== "object" || Array.isArray(parsedUnknown)) {
-    throw new Error("Gemini returned invalid JSON shape.");
+function extractDocumentNumber(text: string): string | null {
+  const panMatch = text.match(/\b([A-Z]{5}\d{4}[A-Z])\b/);
+  if (panMatch?.[1]) return panMatch[1];
+
+  const idMatch = text.match(/\b([A-Z0-9]{6,20})\b/);
+  return idMatch?.[1] ?? null;
+}
+
+function extractGender(text: string): string | null {
+  const match = text.match(/\b(male|female|other|transgender|m|f)\b/i);
+  if (!match?.[1]) return null;
+  const normalized = match[1].toLowerCase();
+  if (normalized === "m") return "Male";
+  if (normalized === "f") return "Female";
+  if (normalized === "transgender") return "Other";
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function extractCasteCategory(text: string): string | null {
+  const match = text.match(/\b(general|obc|sc|st|ews)\b/i);
+  return match?.[1]?.toUpperCase() ?? null;
+}
+
+function extractAnnualIncome(text: string): number | null {
+  const match = text.match(/(?:annual income|income(?: per year)?|yearly income|total income)[^\d\n]*([\d,]+)/i);
+  if (!match?.[1]) return null;
+  const cleaned = match[1].replace(/,/g, "");
+  const num = Number(cleaned);
+  return Number.isFinite(num) ? num : null;
+}
+
+function detectDocumentType(text: string): string | null {
+  const normalized = text.toLowerCase();
+  if (/aadhaar|uidai|unique identification/i.test(normalized)) return "Aadhaar Card";
+  if (/ration card|food security|rationcard/i.test(normalized)) return "Ration Card";
+  if (/pan card|permanent account number|income tax department/i.test(normalized)) return "PAN Card";
+  if (/income certificate|annual income certificate/i.test(normalized)) return "Income Certificate";
+  if (/bpl certificate|below poverty line/i.test(normalized)) return "BPL Certificate";
+  if (/bank passbook|passbook/i.test(normalized)) return "Bank Passbook";
+  if (/land record|jamabandi|khasra|fard|record of rights/i.test(normalized)) return "Land Record";
+  if (/caste certificate|certificate of caste/i.test(normalized)) return "Caste Certificate";
+  return null;
+}
+
+function matchesExpectedDocumentType(expected: string, detected: string | null): boolean {
+  if (!detected) return false;
+  const normalizedExpected = expected.toLowerCase();
+  const normalizedDetected = detected.toLowerCase();
+  return normalizedDetected.includes(normalizedExpected) || normalizedExpected.includes(normalizedDetected);
+}
+
+async function extractTextFromImage(filePath: string): Promise<string> {
+  const worker = await getOcrWorker();
+  const result = await worker.recognize(filePath);
+  return (result.data?.text ?? "").toString();
+}
+
+async function extractTextFromPdf(buffer: Buffer): Promise<string> {
+  const data = await pdfParse(buffer);
+  return data.text ?? "";
+}
+
+async function extractText(filePath: string): Promise<string> {
+  const mimeType = mimeFromPath(filePath);
+  if (mimeType === "application/pdf") {
+    const buffer = await readFile(filePath);
+    return extractTextFromPdf(buffer);
   }
-  const parsed = parsedUnknown as Record<string, unknown>;
+  return extractTextFromImage(filePath);
+}
+
+function buildExtractionResult(text: string, expectedDocumentType: string): VisionExtractionResult {
+  const lines = getLines(text);
+  const detectedDocumentType = detectDocumentType(text);
+  const documentTypeMatches = matchesExpectedDocumentType(expectedDocumentType, detectedDocumentType);
 
   return {
-    fullName: asNullableString(parsed.fullName),
-    dateOfBirth: asNullableString(parsed.dateOfBirth),
-    annualIncome: asNullableNumber(parsed.annualIncome),
-    documentNumber: asNullableString(parsed.documentNumber),
-    issuingAuthority: asNullableString(parsed.issuingAuthority),
-    dateOfIssue: asNullableString(parsed.dateOfIssue),
-    address: asNullableString(parsed.address),
-    fatherName: asNullableString(parsed.fatherName),
-    gender: asNullableString(parsed.gender),
-    aadhaarNumber: asNullableString(parsed.aadhaarNumber),
-    casteCategory: asNullableString(parsed.casteCategory),
-    detectedDocumentType: asNullableString(parsed.detectedDocumentType),
-    documentTypeMatches: asBoolean(parsed.documentTypeMatches, false),
-    readable: asBoolean(parsed.readable, true),
-    extractionNotes: asNullableString(parsed.extractionNotes),
+    fullName: extractLabelValue(lines, [/\bname\b/i, /\bnaam\b/i, /applicant name/i, /beneficiary name/i]) ?? null,
+    dateOfBirth: extractDate(text),
+    annualIncome: extractAnnualIncome(text),
+    documentNumber:
+      extractDocumentNumber(text) ??
+      extractLabelValue(lines, [/document\s*no/i, /doc\s*no/i, /id\s*no/i, /application\s*no/i]) ??
+      null,
+    issuingAuthority: extractLabelValue(lines, [/issued by/i, /authority/i, /issuing authority/i, /office of/i]) ?? null,
+    dateOfIssue: extractDate(text),
+    address: extractLabelValue(lines, [/address/i, /residence/i, /permanent address/i]) ?? null,
+    fatherName: extractLabelValue(lines, [/father's name/i, /father name/i, /son of/i, /daughter of/i]) ?? null,
+    gender: extractGender(text),
+    aadhaarNumber: extractAadhaarNumber(text),
+    casteCategory: extractCasteCategory(text),
+    detectedDocumentType,
+    documentTypeMatches,
+    readable: Boolean(text.trim()),
+    extractionNotes: detectedDocumentType
+      ? null
+      : "Document type could not be determined from text. Please upload a clearer document.",
     analysisFailed: false,
     failureReason: null,
   };
 }
 
-function isQuotaError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /429|quota|Too Many Requests|RESOURCE_EXHAUSTED/i.test(msg);
-}
-
-function isConfigError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /API[_\s-]?key.*(invalid|missing)|PERMISSION_DENIED|UNAUTHENTICATED|authentication|forbidden/i.test(msg);
-}
-
-function isModelError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /models\/.*(not found|is not found)|unknown model|unsupported model|invalid model|for API version/i.test(msg);
-}
-
-function conciseErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  const cleaned = raw
-    .replace(/^\[GoogleGenerativeAI Error\]:\s*/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (cleaned.length <= 220) return cleaned;
-  const firstSentence = cleaned.split(". ")[0]?.trim();
-  if (firstSentence && firstSentence.length > 20 && firstSentence.length <= 220) {
-    return firstSentence.endsWith(".") ? firstSentence : `${firstSentence}.`;
-  }
-  return "Could not analyze document with AI vision.";
-}
-
-function friendlyApiError(err: unknown): { message: string; failureReason: VisionFailureReason } {
-  if (isQuotaError(err)) {
-    return {
-      failureReason: "quota",
-      message:
-        "Gemini API free-tier quota exceeded. Wait about 1 minute and try again, or generate a fresh API key at aistudio.google.com/apikey.",
-    };
-  }
-  if (isConfigError(err)) {
-    return {
-      failureReason: "config",
-      message:
-        "Gemini authentication failed. Check GEMINI_API_KEY in backend/.env and ensure the Gemini API is enabled for that key.",
-    };
-  }
-  if (isModelError(err)) {
-    return {
-      failureReason: "api",
-      // ✅ FIXED: helpful message telling user exactly what to set
-      message:
-        "Gemini model not available. Set GEMINI_MODEL=gemini-1.5-flash-latest in backend/.env and restart the server.",
-    };
-  }
-  return {
-    failureReason: "api",
-    message: conciseErrorMessage(err),
-  };
-}
-
-async function callVisionModel(
-  modelName: string,
-  mimeType: string,
-  base64: string,
-  expectedDocumentType: string
-): Promise<VisionExtractionResult> {
-  const model = genAI.getGenerativeModel({ model: modelName });
-  const result = await model.generateContent([
-    { inlineData: { mimeType, data: base64 } },
-    { text: buildVisionPrompt(expectedDocumentType) },
-  ]);
-
-  const text = result.response.text().trim();
-  if (!text) {
-    return emptyVisionResult("Gemini returned an empty response.");
-  }
-
-  return parseVisionJson(text);
-}
-
-/** Primary extraction: send file bytes to Gemini Vision (images + PDF). */
 export async function extractDocumentFieldsFromFile(
   filePath: string,
   expectedDocumentType: string
 ): Promise<VisionExtractionResult> {
-   console.log("Models to try:", modelsToTry(), "Key prefix:", process.env.GEMINI_API_KEY?.slice(0, 8))
-  if (!process.env.GEMINI_API_KEY?.trim()) {
-    return emptyVisionResult(
-      "GEMINI_API_KEY is not configured on the server.",
-      "config"
-    );
-  }
-
   const mimeType = mimeFromPath(filePath);
   if (!["image/jpeg", "image/png", "application/pdf"].includes(mimeType)) {
     return emptyVisionResult(`Unsupported file type: ${mimeType}`);
   }
 
-  const buffer = await readFile(filePath);
-  const base64 = buffer.toString("base64");
-  const models = modelsToTry();
-  const failures: Array<{ modelName: string; message: string; failureReason: VisionFailureReason }> = [];
-
-  for (const modelName of models) {
-    try {
-      console.log(`Gemini vision: trying model ${modelName}`);
-      return await callVisionModel(modelName, mimeType, base64, expectedDocumentType);
-    } catch (err) {
-      console.error(`Gemini vision failed (${modelName}):`, err);
-      const { message, failureReason } = friendlyApiError(err);
-      failures.push({ modelName, message, failureReason });
-      if (failureReason === "config") {
-        // Wrong API key — no point trying other models
-        return emptyVisionResult(message, failureReason);
-      }
-      continue;
+  try {
+    const text = await extractText(filePath);
+    if (!text.trim()) {
+      return emptyVisionResult(
+        "Could not read any text from the document. Upload a clearer image or PDF.",
+        "api"
+      );
     }
-  }
 
-  // All models failed — return the most useful error
-  const quotaFailure = failures.find((f) => f.failureReason === "quota");
-  if (quotaFailure) {
-    return emptyVisionResult(quotaFailure.message, "quota");
+    return buildExtractionResult(text, expectedDocumentType);
+  } catch (err) {
+    console.error("OCR extraction failed:", err);
+    return emptyVisionResult(
+      "Local OCR failed while reading the document. Upload a clearer image or PDF.",
+      "api"
+    );
   }
-
-  const lastFailure = failures.at(-1);
-  return emptyVisionResult(
-    lastFailure?.message ?? "Could not analyze document with AI vision.",
-    lastFailure?.failureReason ?? "api"
-  );
 }
